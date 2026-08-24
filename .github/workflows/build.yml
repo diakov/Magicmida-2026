@@ -9,7 +9,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Lazarus
         shell: powershell
@@ -31,7 +31,7 @@ jobs:
       - name: Build Magicmida x64
         shell: powershell
         run: |
-          & "$env:LAZBUILD" "Magicmida.lpi" --build-mode=Release
+          & "$env:LAZBUILD" "Magicmida.lpi" --build-mode=Win64
 
       - name: Show generated EXE files
         shell: powershell
