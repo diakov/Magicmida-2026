@@ -25,6 +25,14 @@ jobs:
           $src = "$env:RUNNER_TEMP\fpcsrc"
           $install = "$env:RUNNER_TEMP\fpc331"
 
+          if (-not (Test-Path $bootstrap)) {
+            throw "Bootstrap FPC 3.2.2 not found"
+          }
+
+          if (-not (Test-Path $make)) {
+            throw "Bootstrap make.exe not found"
+          }
+
           git clone --depth 1 https://github.com/fpc/FPCSource.git $src
 
           New-Item -ItemType Directory -Force -Path $install | Out-Null
@@ -37,6 +45,7 @@ jobs:
             INSTALL_PREFIX="$install"
 
           if ($LASTEXITCODE -ne 0) {
+            Pop-Location
             exit $LASTEXITCODE
           }
 
@@ -56,7 +65,10 @@ jobs:
           echo "FPC331BIN=$($compiler.Directory.FullName)" >> $env:GITHUB_ENV
           echo "FPC331ROOT=$install" >> $env:GITHUB_ENV
 
-      - name: Configure FPC
+          # Make FPC 3.3.1 visible to lazbuild and subsequent steps
+          echo "$($compiler.Directory.FullName)" >> $env:GITHUB_PATH
+
+      - name: Configure FPC 3.3.1
         shell: powershell
         run: |
           $cfg = Join-Path "$env:FPC331BIN" "fpc.cfg"
@@ -65,6 +77,20 @@ jobs:
           -Fu$env:FPC331ROOT\units\x86_64-win64\rtl
           -Fu$env:FPC331ROOT\units\x86_64-win64\*
           "@ | Set-Content -Path $cfg -Encoding ASCII
+
+      - name: Verify FPC 3.3.1
+        shell: powershell
+        run: |
+          where.exe fpc
+
+          Write-Host "Version:"
+          fpc.exe -iV
+
+          Write-Host "CPU:"
+          fpc.exe -iTP
+
+          Write-Host "OS:"
+          fpc.exe -iTO
 
       - name: Get current Lazarus source
         shell: powershell
@@ -80,16 +106,24 @@ jobs:
         run: |
           $make = "C:\lazarus\fpc\3.2.2\bin\x86_64-win64\make.exe"
 
+          Write-Host "Compiler visible to Lazarus:"
+          where.exe fpc
+
+          Write-Host "FPC version:"
+          fpc.exe -iV
+
           Push-Location "$env:LAZSRC"
 
           & $make `
             clean all `
             FPC="$env:FPC331" `
+            PP="$env:FPC331" `
             CPU_TARGET=x86_64 `
             OS_TARGET=win64 `
             LCL_PLATFORM=win32
 
           if ($LASTEXITCODE -ne 0) {
+            Pop-Location
             exit $LASTEXITCODE
           }
 
@@ -101,7 +135,7 @@ jobs:
           $lazbuild = Join-Path "$env:LAZSRC" "lazbuild.exe"
 
           if (-not (Test-Path $lazbuild)) {
-            throw "New lazbuild.exe not found"
+            throw "lazbuild.exe not found"
           }
 
           & $lazbuild `
