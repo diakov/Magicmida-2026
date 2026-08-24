@@ -1,0 +1,46 @@
+name: Build Magicmida x64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Lazarus
+        shell: powershell
+        run: choco install lazarus -y
+
+      - name: Find lazbuild
+        shell: powershell
+        run: |
+          $exe = Get-ChildItem "C:\" -Filter lazbuild.exe -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "lazbuild.exe not found"
+          }
+
+          echo "LAZBUILD=$($exe.FullName)" >> $env:GITHUB_ENV
+          Write-Host "Found: $($exe.FullName)"
+
+      - name: Build Magicmida x64
+        shell: powershell
+        run: |
+          & "$env:LAZBUILD" "Magicmida.lpi" --build-mode=Release
+
+      - name: Show generated EXE files
+        shell: powershell
+        run: |
+          Get-ChildItem -Path . -Filter *.exe -Recurse
+
+      - name: Upload Magicmida
+        uses: actions/upload-artifact@v4
+        with:
+          name: Magicmida-2026-x64
+          path: |
+            **/Magicmida.exe
