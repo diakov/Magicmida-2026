@@ -8,10 +8,10 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout Magicmida
         uses: actions/checkout@v5
 
-      - name: Install Lazarus
+      - name: Install bootstrap Lazarus/FPC
         shell: powershell
         run: |
           choco install lazarus -y
@@ -25,14 +25,6 @@ jobs:
           $src = "$env:RUNNER_TEMP\fpcsrc"
           $install = "$env:RUNNER_TEMP\fpc331"
 
-          if (-not (Test-Path $bootstrap)) {
-            throw "Bootstrap FPC 3.2.2 not found"
-          }
-
-          if (-not (Test-Path $make)) {
-            throw "make.exe not found"
-          }
-
           git clone --depth 1 https://github.com/fpc/FPCSource.git $src
 
           New-Item -ItemType Directory -Force -Path $install | Out-Null
@@ -45,7 +37,6 @@ jobs:
             INSTALL_PREFIX="$install"
 
           if ($LASTEXITCODE -ne 0) {
-            Pop-Location
             exit $LASTEXITCODE
           }
 
@@ -65,7 +56,7 @@ jobs:
           echo "FPC331BIN=$($compiler.Directory.FullName)" >> $env:GITHUB_ENV
           echo "FPC331ROOT=$install" >> $env:GITHUB_ENV
 
-      - name: Configure FPC 3.3.1
+      - name: Configure FPC
         shell: powershell
         run: |
           $cfg = Join-Path "$env:FPC331BIN" "fpc.cfg"
@@ -75,33 +66,21 @@ jobs:
           -Fu$env:FPC331ROOT\units\x86_64-win64\*
           "@ | Set-Content -Path $cfg -Encoding ASCII
 
-          Write-Host "Created:"
-          Write-Host $cfg
-
-          Get-Content $cfg
-
-      - name: Verify FPC 3.3.1
+      - name: Get current Lazarus source
         shell: powershell
         run: |
-          Write-Host "Version:"
-          & "$env:FPC331" -iV
+          $lazsrc = "$env:RUNNER_TEMP\lazarus-main"
 
-          Write-Host "CPU:"
-          & "$env:FPC331" -iTP
+          git clone --depth 1 https://github.com/fpc/Lazarus.git $lazsrc
 
-          Write-Host "OS:"
-          & "$env:FPC331" -iTO
+          echo "LAZSRC=$lazsrc" >> $env:GITHUB_ENV
 
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-
-      - name: Rebuild Lazarus with FPC 3.3.1
+      - name: Build Lazarus with FPC 3.3.1
         shell: powershell
         run: |
           $make = "C:\lazarus\fpc\3.2.2\bin\x86_64-win64\make.exe"
 
-          Push-Location "C:\lazarus"
+          Push-Location "$env:LAZSRC"
 
           & $make `
             clean all `
@@ -111,7 +90,6 @@ jobs:
             LCL_PLATFORM=win32
 
           if ($LASTEXITCODE -ne 0) {
-            Pop-Location
             exit $LASTEXITCODE
           }
 
@@ -120,7 +98,13 @@ jobs:
       - name: Build Magicmida x64
         shell: powershell
         run: |
-          & "C:\lazarus\lazbuild.exe" `
+          $lazbuild = Join-Path "$env:LAZSRC" "lazbuild.exe"
+
+          if (-not (Test-Path $lazbuild)) {
+            throw "New lazbuild.exe not found"
+          }
+
+          & $lazbuild `
             "Magicmida.lpi" `
             --build-mode=Win64 `
             --compiler="$env:FPC331"
