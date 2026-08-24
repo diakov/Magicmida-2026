@@ -21,8 +21,17 @@ jobs:
         run: |
           $bootstrap = "C:\lazarus\fpc\3.2.2\bin\x86_64-win64\fpc.exe"
           $make = "C:\lazarus\fpc\3.2.2\bin\x86_64-win64\make.exe"
+
           $src = "$env:RUNNER_TEMP\fpcsrc"
           $install = "$env:RUNNER_TEMP\fpc331"
+
+          if (-not (Test-Path $bootstrap)) {
+            throw "Bootstrap FPC 3.2.2 not found"
+          }
+
+          if (-not (Test-Path $make)) {
+            throw "make.exe not found"
+          }
 
           git clone --depth 1 https://github.com/fpc/FPCSource.git $src
 
@@ -36,6 +45,7 @@ jobs:
             INSTALL_PREFIX="$install"
 
           if ($LASTEXITCODE -ne 0) {
+            Pop-Location
             exit $LASTEXITCODE
           }
 
@@ -43,7 +53,8 @@ jobs:
 
           $compiler = Get-ChildItem $install `
             -Filter fpc.exe `
-            -Recurse |
+            -Recurse `
+            -ErrorAction SilentlyContinue |
             Select-Object -First 1
 
           if (-not $compiler) {
@@ -51,7 +62,39 @@ jobs:
           }
 
           echo "FPC331=$($compiler.FullName)" >> $env:GITHUB_ENV
-          echo "$($compiler.Directory.FullName)" >> $env:GITHUB_PATH
+          echo "FPC331BIN=$($compiler.Directory.FullName)" >> $env:GITHUB_ENV
+          echo "FPC331ROOT=$install" >> $env:GITHUB_ENV
+
+      - name: Configure FPC 3.3.1
+        shell: powershell
+        run: |
+          $cfg = Join-Path "$env:FPC331BIN" "fpc.cfg"
+
+          @"
+          -Fu$env:FPC331ROOT\units\x86_64-win64\rtl
+          -Fu$env:FPC331ROOT\units\x86_64-win64\*
+          "@ | Set-Content -Path $cfg -Encoding ASCII
+
+          Write-Host "Created:"
+          Write-Host $cfg
+
+          Get-Content $cfg
+
+      - name: Verify FPC 3.3.1
+        shell: powershell
+        run: |
+          Write-Host "Version:"
+          & "$env:FPC331" -iV
+
+          Write-Host "CPU:"
+          & "$env:FPC331" -iTP
+
+          Write-Host "OS:"
+          & "$env:FPC331" -iTO
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
 
       - name: Rebuild Lazarus with FPC 3.3.1
         shell: powershell
@@ -68,6 +111,7 @@ jobs:
             LCL_PLATFORM=win32
 
           if ($LASTEXITCODE -ne 0) {
+            Pop-Location
             exit $LASTEXITCODE
           }
 
