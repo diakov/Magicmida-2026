@@ -13,30 +13,85 @@ jobs:
 
       - name: Install Lazarus
         shell: powershell
-        run: choco install lazarus -y
+        run: |
+          choco install lazarus -y
 
-      - name: Find lazbuild
+      - name: Download FPC 3.3.1 snapshot
         shell: powershell
         run: |
-          $exe = Get-ChildItem "C:\" -Filter lazbuild.exe -Recurse -ErrorAction SilentlyContinue |
+          $url = "https://downloads.freepascal.org/fpc/snapshot/trunk/x86_64-win64/fpc-3.3.1.x86_64-win64.built.on.i386-win32.zip"
+          $zip = "$env:RUNNER_TEMP\fpc331.zip"
+          $dst = "$env:RUNNER_TEMP\fpc331"
+
+          Write-Host "Downloading FPC 3.3.1..."
+          Invoke-WebRequest -Uri $url -OutFile $zip
+
+          Write-Host "Extracting..."
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $dst -Force
+
+          Write-Host "FPC snapshot contents:"
+          Get-ChildItem $dst -Depth 3
+
+      - name: Locate FPC 3.3.1
+        shell: powershell
+        run: |
+          $root = "$env:RUNNER_TEMP\fpc331"
+
+          $fpc = Get-ChildItem $root -Filter fpc.exe -Recurse -ErrorAction SilentlyContinue |
             Select-Object -First 1
 
-          if (-not $exe) {
+          if (-not $fpc) {
+            throw "FPC 3.3.1 fpc.exe not found"
+          }
+
+          Write-Host "Found FPC:"
+          Write-Host $fpc.FullName
+
+          echo "FPC331=$($fpc.FullName)" >> $env:GITHUB_ENV
+          echo "FPC331DIR=$($fpc.Directory.FullName)" >> $env:GITHUB_ENV
+
+      - name: Verify FPC 3.3.1
+        shell: powershell
+        run: |
+          & "$env:FPC331" -iV
+          & "$env:FPC331" -iTP
+          & "$env:FPC331" -iTO
+
+      - name: Configure Lazarus
+        shell: powershell
+        run: |
+          $lazbuild = "C:\lazarus\lazbuild.exe"
+
+          if (-not (Test-Path $lazbuild)) {
             throw "lazbuild.exe not found"
           }
 
-          echo "LAZBUILD=$($exe.FullName)" >> $env:GITHUB_ENV
-          Write-Host "Found: $($exe.FullName)"
+          echo "LAZBUILD=$lazbuild" >> $env:GITHUB_ENV
+
+          Write-Host "Lazarus:"
+          & $lazbuild --version
 
       - name: Build Magicmida x64
         shell: powershell
         run: |
-          & "$env:LAZBUILD" "Magicmida.lpi" --build-mode=Win64
+          Write-Host "Compiler:"
+          Write-Host "$env:FPC331"
 
-      - name: Show generated EXE files
+          & "$env:LAZBUILD" `
+            "Magicmida.lpi" `
+            --build-mode=Win64 `
+            --compiler="$env:FPC331"
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Show generated files
         shell: powershell
         run: |
-          Get-ChildItem -Path . -Filter *.exe -Recurse
+          Get-ChildItem -Path . -Filter *.exe -Recurse |
+            Select-Object FullName, Length
 
       - name: Upload Magicmida
         uses: actions/upload-artifact@v4
@@ -44,3 +99,4 @@ jobs:
           name: Magicmida-2026-x64
           path: |
             **/Magicmida.exe
+          if-no-files-found: error
