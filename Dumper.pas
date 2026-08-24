@@ -398,6 +398,14 @@ var
   WinnerRM: PRemoteModule;
   FuncAddr: Pointer;
   DiagIndex: Integer;
+
+  // --- PE2026 ordinal-only group resolver ---
+  OrdinalOnlyGroup: Boolean;
+  OrdinalCandidateCount: Integer;
+  OrdinalMatched, OrdinalRequired: Integer;
+  OrdinalCandidateRM, OrdinalWinnerRM: PRemoteModule;
+  OrdinalFuncName: string;
+  OrdinalFuncAddr: Pointer;
 begin
   if FIAT = 0 then
     raise Exception.Create('Must set IAT before calling Process()');
@@ -596,6 +604,121 @@ begin
       end;
     end;
 
+    // =========================================================
+    // PE2026 ordinal-only resolver
+    //
+    // A protected image may keep IMAGE_ORDINAL_FLAG|ordinal values
+    // directly in a zero-delimited IAT group. Such values are not live
+    // API addresses, so PASS 1 cannot associate them with a module.
+    //
+    // If the whole group consists only of encoded ordinals and voting
+    // produced no winner, scan every loaded module and accept a module
+    // only when it exports EVERY ordinal in the group. Resolve only when
+    // exactly one module matches; ambiguous groups are deliberately left
+    // untouched.
+    // =========================================================
+    OrdinalOnlyGroup := WinnerRM = nil;
+    OrdinalRequired := 0;
+
+    if OrdinalOnlyGroup then
+      for j := GroupStart to GroupEnd do
+      begin
+        if not Slots[j].IsEncodedOrdinal then
+        begin
+          OrdinalOnlyGroup := False;
+          Break;
+        end;
+        Inc(OrdinalRequired);
+      end;
+
+    if OrdinalOnlyGroup and (OrdinalRequired > 0) then
+    begin
+      Log(ltInfo, Format(
+        '[IAT2026] ordinal-only group: slots=%d..%d VA=%X..%X ordinals=%d',
+        [GroupStart, GroupEnd,
+         FIAT + NativeUInt(GroupStart) * SizeOf(Pointer),
+         FIAT + NativeUInt(GroupEnd) * SizeOf(Pointer),
+         OrdinalRequired]));
+
+      OrdinalCandidateCount := 0;
+      OrdinalWinnerRM := nil;
+
+      for OrdinalCandidateRM in FAllModules do
+      begin
+        OrdinalMatched := 0;
+
+        for j := GroupStart to GroupEnd do
+        begin
+          OrdinalFuncName := '#' + IntToStr(Slots[j].EncodedOrdinal);
+
+          for OrdinalFuncAddr in OrdinalCandidateRM.ExportTbl.Keys do
+            if OrdinalCandidateRM.ExportTbl[OrdinalFuncAddr] = OrdinalFuncName then
+            begin
+              Inc(OrdinalMatched);
+              Break;
+            end;
+        end;
+
+        if OrdinalMatched > 0 then
+          Log(ltInfo, Format(
+            '[IAT2026]   candidate module=%s matched=%d/%d',
+            [OrdinalCandidateRM.Name, OrdinalMatched, OrdinalRequired]));
+
+        if OrdinalMatched = OrdinalRequired then
+        begin
+          Inc(OrdinalCandidateCount);
+          OrdinalWinnerRM := OrdinalCandidateRM;
+          Log(ltInfo, Format(
+            '[IAT2026]   FULL MATCH module=%s (%d/%d)',
+            [OrdinalCandidateRM.Name, OrdinalMatched, OrdinalRequired]));
+        end;
+      end;
+
+      if OrdinalCandidateCount = 1 then
+      begin
+        WinnerRM := OrdinalWinnerRM;
+        WinnerName := WinnerRM.Name;
+        WinnerVotes := OrdinalRequired;
+
+        Log(ltInfo, Format(
+          '[IAT2026] ordinal-only resolved: slots=%d..%d -> %s',
+          [GroupStart, GroupEnd, WinnerName]));
+
+        // Materialize normal candidates for all ordinal slots so the
+        // existing thunk-building path below can remain unchanged.
+        for j := GroupStart to GroupEnd do
+        begin
+          OrdinalFuncName := '#' + IntToStr(Slots[j].EncodedOrdinal);
+
+          for OrdinalFuncAddr in WinnerRM.ExportTbl.Keys do
+            if WinnerRM.ExportTbl[OrdinalFuncAddr] = OrdinalFuncName then
+            begin
+              Cand.Address := OrdinalFuncAddr;
+              Cand.Module := WinnerRM;
+              Slots[j].Candidates.Add(Cand);
+              Slots[j].ChosenCandidate := Slots[j].Candidates.Count - 1;
+
+              Log(ltInfo, Format(
+                '[IAT2026]   slot=%d VA=%X ordinal=%s -> %s @ %X',
+                [j,
+                 FIAT + NativeUInt(j) * SizeOf(Pointer),
+                 OrdinalFuncName,
+                 WinnerName,
+                 NativeUInt(OrdinalFuncAddr)]));
+              Break;
+            end;
+        end;
+      end
+      else if OrdinalCandidateCount = 0 then
+        Log(ltInfo, Format(
+          '[IAT2026] ordinal-only unresolved: slots=%d..%d no module exports all ordinals',
+          [GroupStart, GroupEnd]))
+      else
+        Log(ltInfo, Format(
+          '[IAT2026] ordinal-only ambiguous: slots=%d..%d full-match modules=%d; leaving unresolved',
+          [GroupStart, GroupEnd, OrdinalCandidateCount]));
+    end;
+
     // PE2026: show why an ordinal-containing group did or did not
     // get a module winner.
     for j := GroupStart to GroupEnd do
@@ -649,7 +772,7 @@ begin
         end;
 
     ApiSetName := '';
-    if AllowApiSets then
+    if AllowApiSets and (WinnerRM <> nil) then
       for j := GroupStart to GroupEnd do
       begin
         if (Slots[j].ChosenCandidate < 0) and (Slots[j].Candidates.Count = 0) then
