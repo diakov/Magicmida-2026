@@ -1,3 +1,21 @@
+name: Build Magicmida x64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Lazarus
+        shell: powershell
+        run: |
+          choco install lazarus -y
+
       - name: Build FPC 3.3.1 from source
         shell: powershell
         run: |
@@ -50,7 +68,9 @@
           }
 
           if (-not $compiler) {
-            Get-ChildItem $install -Recurse | Select-Object FullName
+            Get-ChildItem $install -Recurse |
+              Select-Object FullName
+
             throw "Built FPC compiler not found"
           }
 
@@ -58,3 +78,41 @@
 
           Write-Host "Compiler:"
           Write-Host $compiler.FullName
+
+      - name: Verify FPC 3.3.1
+        shell: powershell
+        run: |
+          Write-Host "Version:"
+          & "$env:FPC331" -iV
+
+          Write-Host "CPU:"
+          & "$env:FPC331" -iTP
+
+          Write-Host "OS:"
+          & "$env:FPC331" -iTO
+
+      - name: Build Magicmida x64
+        shell: powershell
+        run: |
+          & "C:\lazarus\lazbuild.exe" `
+            "Magicmida.lpi" `
+            --build-mode=Win64 `
+            --compiler="$env:FPC331"
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Show generated EXE
+        shell: powershell
+        run: |
+          Get-ChildItem . -Filter Magicmida.exe -Recurse |
+            Select-Object FullName, Length
+
+      - name: Upload Magicmida
+        uses: actions/upload-artifact@v4
+        with:
+          name: Magicmida-2026-x64
+          path: |
+            **/Magicmida.exe
+          if-no-files-found: error
