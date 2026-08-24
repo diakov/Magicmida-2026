@@ -1,185 +1,60 @@
-name: Build Magicmida x64
-
-on:
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: windows-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install Lazarus
+      - name: Build FPC 3.3.1 from source
         shell: powershell
         run: |
-          choco install lazarus -y
+          $bootstrap = "C:\lazarus\fpc\3.2.2\bin\x86_64-win64\fpc.exe"
+          $make = "C:\lazarus\fpc\3.2.2\bin\x86_64-win64\make.exe"
 
-      - name: Download and unpack FPC 3.3.1
-        shell: powershell
-        run: |
-          $url = "https://downloads.freepascal.org/fpc/snapshot/trunk/x86_64-win64/fpc-3.3.1.x86_64-win64.built.on.i386-win32.zip"
-
-          $zip  = "$env:RUNNER_TEMP\fpc331.zip"
-          $root = "$env:RUNNER_TEMP\fpc331"
-          $full = "$env:RUNNER_TEMP\fpc331-full"
-
-          Write-Host "Downloading FPC 3.3.1 snapshot..."
-          Invoke-WebRequest -Uri $url -OutFile $zip
-
-          New-Item -ItemType Directory -Force -Path $root | Out-Null
-          New-Item -ItemType Directory -Force -Path $full | Out-Null
-
-          Write-Host "Extracting outer archive..."
-          Expand-Archive -Path $zip -DestinationPath $root -Force
-
-          Write-Host "Files in outer archive:"
-          Get-ChildItem $root -Recurse |
-            Select-Object FullName
-
-          # Snapshot may contain installation ZIP packages.
-          # Extract every nested ZIP into one installation tree.
-          $nested = Get-ChildItem $root -Filter *.zip -Recurse
-
-          if ($nested.Count -gt 0) {
-            Write-Host ""
-            Write-Host "Nested FPC packages found:"
-            $nested | ForEach-Object {
-              Write-Host $_.FullName
-            }
-
-            foreach ($package in $nested) {
-              Write-Host "Extracting $($package.Name)..."
-              Expand-Archive `
-                -Path $package.FullName `
-                -DestinationPath $full `
-                -Force
-            }
-          }
-          else {
-            Write-Host "No nested ZIPs. Using outer tree."
-            Copy-Item "$root\*" $full -Recurse -Force
+          if (-not (Test-Path $bootstrap)) {
+            throw "Bootstrap FPC 3.2.2 not found"
           }
 
-          echo "FPCROOT=$full" >> $env:GITHUB_ENV
+          if (-not (Test-Path $make)) {
+            throw "make.exe not found"
+          }
 
-      - name: Locate FPC 3.3.1 compiler
-        shell: powershell
-        run: |
-          Write-Host "Searching installation tree:"
-          Write-Host "$env:FPCROOT"
+          $src = "$env:RUNNER_TEMP\fpcsrc"
+          $install = "$env:RUNNER_TEMP\fpc331"
 
-          $compiler = Get-ChildItem `
-            $env:FPCROOT `
-            -Filter ppcx64.exe `
+          git clone --depth 1 https://github.com/fpc/FPCSource.git $src
+
+          New-Item -ItemType Directory -Force -Path $install | Out-Null
+
+          Push-Location $src
+
+          & $make `
+            clean all install `
+            FPC="$bootstrap" `
+            INSTALL_PREFIX="$install"
+
+          if ($LASTEXITCODE -ne 0) {
+            Pop-Location
+            exit $LASTEXITCODE
+          }
+
+          Pop-Location
+
+          Write-Host "Searching installed compiler..."
+
+          $compiler = Get-ChildItem $install `
+            -Filter fpc.exe `
             -Recurse `
             -ErrorAction SilentlyContinue |
-              Select-Object -First 1
+            Select-Object -First 1
 
           if (-not $compiler) {
-            $compiler = Get-ChildItem `
-              $env:FPCROOT `
-              -Filter fpc.exe `
+            $compiler = Get-ChildItem $install `
+              -Filter ppcx64.exe `
               -Recurse `
               -ErrorAction SilentlyContinue |
-                Select-Object -First 1
+              Select-Object -First 1
           }
 
           if (-not $compiler) {
-            Write-Host ""
-            Write-Host "EXE files actually present:"
-            Get-ChildItem $env:FPCROOT -Filter *.exe -Recurse |
-              Select-Object FullName
-
-            throw "FPC 3.3.1 compiler executable was not found"
+            Get-ChildItem $install -Recurse | Select-Object FullName
+            throw "Built FPC compiler not found"
           }
-
-          Write-Host ""
-          Write-Host "Compiler found:"
-          Write-Host $compiler.FullName
 
           echo "FPC331=$($compiler.FullName)" >> $env:GITHUB_ENV
-          echo "FPC331BIN=$($compiler.Directory.FullName)" >> $env:GITHUB_ENV
 
-      - name: Create FPC 3.3.1 config
-        shell: powershell
-        run: |
-          $cfg = Join-Path $env:FPC331BIN "fpc.cfg"
-
-          $root = $env:FPCROOT.Replace('\','/')
-
-          @"
-          -Mobjfpc
-          -Sh
-          -Fu$root/units/x86_64-win64
-          -Fu$root/units/x86_64-win64/*
-          -Fu$root/units/x86_64-win64/rtl
-          -Fl$root/bin/x86_64-win64
-          "@ | Set-Content -Path $cfg -Encoding ASCII
-
-          Write-Host "Created:"
-          Write-Host $cfg
-          Get-Content $cfg
-
-      - name: Verify FPC 3.3.1
-        shell: powershell
-        run: |
           Write-Host "Compiler:"
-          Write-Host "$env:FPC331"
-
-          Write-Host "Version:"
-          & "$env:FPC331" -iV
-
-          Write-Host "CPU:"
-          & "$env:FPC331" -iTP
-
-          Write-Host "OS:"
-          & "$env:FPC331" -iTO
-
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-
-      - name: Configure Lazarus
-        shell: powershell
-        run: |
-          $lazbuild = "C:\lazarus\lazbuild.exe"
-
-          if (-not (Test-Path $lazbuild)) {
-            throw "lazbuild.exe not found"
-          }
-
-          echo "LAZBUILD=$lazbuild" >> $env:GITHUB_ENV
-
-          Write-Host "Lazarus:"
-          & "$lazbuild" --version
-
-      - name: Build Magicmida x64
-        shell: powershell
-        run: |
-          Write-Host "FPC compiler:"
-          Write-Host "$env:FPC331"
-
-          & "$env:LAZBUILD" `
-            "Magicmida.lpi" `
-            --build-mode=Win64 `
-            --compiler="$env:FPC331"
-
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-
-      - name: Show generated EXE
-        shell: powershell
-        run: |
-          Get-ChildItem . -Filter Magicmida.exe -Recurse |
-            Select-Object FullName, Length
-
-      - name: Upload Magicmida
-        uses: actions/upload-artifact@v4
-        with:
-          name: Magicmida-2026-x64
-          path: |
-            **/Magicmida.exe
-          if-no-files-found: error
+          Write-Host $compiler.FullName
