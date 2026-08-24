@@ -65,7 +65,6 @@ jobs:
           echo "FPC331BIN=$($compiler.Directory.FullName)" >> $env:GITHUB_ENV
           echo "FPC331ROOT=$install" >> $env:GITHUB_ENV
 
-          # Make FPC 3.3.1 visible to lazbuild and subsequent steps
           echo "$($compiler.Directory.FullName)" >> $env:GITHUB_PATH
 
       - name: Configure FPC 3.3.1
@@ -74,6 +73,8 @@ jobs:
           $cfg = Join-Path "$env:FPC331BIN" "fpc.cfg"
 
           @"
+          -Sc
+          -Sh
           -Fu$env:FPC331ROOT\units\x86_64-win64\rtl
           -Fu$env:FPC331ROOT\units\x86_64-win64\*
           "@ | Set-Content -Path $cfg -Encoding ASCII
@@ -106,10 +107,7 @@ jobs:
         run: |
           $make = "C:\lazarus\fpc\3.2.2\bin\x86_64-win64\make.exe"
 
-          Write-Host "Compiler visible to Lazarus:"
           where.exe fpc
-
-          Write-Host "FPC version:"
           fpc.exe -iV
 
           Push-Location "$env:LAZSRC"
