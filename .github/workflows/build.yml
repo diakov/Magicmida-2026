@@ -23,40 +23,59 @@ jobs:
           $zip = "$env:RUNNER_TEMP\fpc331.zip"
           $dst = "$env:RUNNER_TEMP\fpc331"
 
-          Write-Host "Downloading FPC 3.3.1..."
           Invoke-WebRequest -Uri $url -OutFile $zip
 
-          Write-Host "Extracting..."
           New-Item -ItemType Directory -Force -Path $dst | Out-Null
           Expand-Archive -Path $zip -DestinationPath $dst -Force
 
-          Write-Host "FPC snapshot contents:"
-          Get-ChildItem $dst -Depth 3
+          Write-Host "Snapshot extracted to:"
+          Write-Host $dst
 
       - name: Locate FPC 3.3.1
         shell: powershell
         run: |
           $root = "$env:RUNNER_TEMP\fpc331"
 
-          $fpc = Get-ChildItem $root -Filter fpc.exe -Recurse -ErrorAction SilentlyContinue |
+          Write-Host "Searching compiler executables..."
+
+          Get-ChildItem $root -Recurse -Include fpc.exe,ppcx64.exe |
+            Select-Object FullName
+
+          $compiler = Get-ChildItem $root -Filter fpc.exe -Recurse -ErrorAction SilentlyContinue |
             Select-Object -First 1
 
-          if (-not $fpc) {
-            throw "FPC 3.3.1 fpc.exe not found"
+          if (-not $compiler) {
+            $compiler = Get-ChildItem $root -Filter ppcx64.exe -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 1
           }
 
-          Write-Host "Found FPC:"
-          Write-Host $fpc.FullName
+          if (-not $compiler) {
+            throw "Neither fpc.exe nor ppcx64.exe was found"
+          }
 
-          echo "FPC331=$($fpc.FullName)" >> $env:GITHUB_ENV
-          echo "FPC331DIR=$($fpc.Directory.FullName)" >> $env:GITHUB_ENV
+          Write-Host "Selected compiler:"
+          Write-Host $compiler.FullName
+
+          echo "FPC331=$($compiler.FullName)" >> $env:GITHUB_ENV
 
       - name: Verify FPC 3.3.1
         shell: powershell
         run: |
+          Write-Host "Compiler:"
+          Write-Host "$env:FPC331"
+
+          Write-Host "Version:"
           & "$env:FPC331" -iV
+
+          Write-Host "CPU:"
           & "$env:FPC331" -iTP
+
+          Write-Host "OS:"
           & "$env:FPC331" -iTO
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
 
       - name: Configure Lazarus
         shell: powershell
@@ -69,13 +88,10 @@ jobs:
 
           echo "LAZBUILD=$lazbuild" >> $env:GITHUB_ENV
 
-          Write-Host "Lazarus:"
-          & $lazbuild --version
-
       - name: Build Magicmida x64
         shell: powershell
         run: |
-          Write-Host "Compiler:"
+          Write-Host "Using:"
           Write-Host "$env:FPC331"
 
           & "$env:LAZBUILD" `
@@ -87,7 +103,7 @@ jobs:
             exit $LASTEXITCODE
           }
 
-      - name: Show generated files
+      - name: Show generated EXE files
         shell: powershell
         run: |
           Get-ChildItem -Path . -Filter *.exe -Recurse |
