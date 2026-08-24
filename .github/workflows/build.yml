@@ -16,20 +16,11 @@ jobs:
         run: |
           choco install lazarus -y
 
-      - name: Build FPC 3.3.1 from source
+      - name: Build FPC 3.3.1
         shell: powershell
         run: |
           $bootstrap = "C:\lazarus\fpc\3.2.2\bin\x86_64-win64\fpc.exe"
           $make = "C:\lazarus\fpc\3.2.2\bin\x86_64-win64\make.exe"
-
-          if (-not (Test-Path $bootstrap)) {
-            throw "Bootstrap FPC 3.2.2 not found"
-          }
-
-          if (-not (Test-Path $make)) {
-            throw "make.exe not found"
-          }
-
           $src = "$env:RUNNER_TEMP\fpcsrc"
           $install = "$env:RUNNER_TEMP\fpc331"
 
@@ -45,51 +36,42 @@ jobs:
             INSTALL_PREFIX="$install"
 
           if ($LASTEXITCODE -ne 0) {
-            Pop-Location
             exit $LASTEXITCODE
           }
 
           Pop-Location
 
-          Write-Host "Searching installed compiler..."
-
           $compiler = Get-ChildItem $install `
             -Filter fpc.exe `
-            -Recurse `
-            -ErrorAction SilentlyContinue |
+            -Recurse |
             Select-Object -First 1
 
           if (-not $compiler) {
-            $compiler = Get-ChildItem $install `
-              -Filter ppcx64.exe `
-              -Recurse `
-              -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-          }
-
-          if (-not $compiler) {
-            Get-ChildItem $install -Recurse |
-              Select-Object FullName
-
-            throw "Built FPC compiler not found"
+            throw "FPC 3.3.1 not found"
           }
 
           echo "FPC331=$($compiler.FullName)" >> $env:GITHUB_ENV
+          echo "$($compiler.Directory.FullName)" >> $env:GITHUB_PATH
 
-          Write-Host "Compiler:"
-          Write-Host $compiler.FullName
-
-      - name: Verify FPC 3.3.1
+      - name: Rebuild Lazarus with FPC 3.3.1
         shell: powershell
         run: |
-          Write-Host "Version:"
-          & "$env:FPC331" -iV
+          $make = "C:\lazarus\fpc\3.2.2\bin\x86_64-win64\make.exe"
 
-          Write-Host "CPU:"
-          & "$env:FPC331" -iTP
+          Push-Location "C:\lazarus"
 
-          Write-Host "OS:"
-          & "$env:FPC331" -iTO
+          & $make `
+            clean all `
+            FPC="$env:FPC331" `
+            CPU_TARGET=x86_64 `
+            OS_TARGET=win64 `
+            LCL_PLATFORM=win32
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          Pop-Location
 
       - name: Build Magicmida x64
         shell: powershell
@@ -102,12 +84,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
-
-      - name: Show generated EXE
-        shell: powershell
-        run: |
-          Get-ChildItem . -Filter Magicmida.exe -Recurse |
-            Select-Object FullName, Length
 
       - name: Upload Magicmida
         uses: actions/upload-artifact@v4
