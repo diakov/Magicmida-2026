@@ -105,6 +105,18 @@ implementation
 
 uses OneCoreUAP;
 
+type
+  // PE2026 diagnostic helper. Pointer-sized fields keep this compatible
+  // with both Win32 and Win64 builds.
+  TImageTlsDirectoryNative = packed record
+    StartAddressOfRawData: NativeUInt;
+    EndAddressOfRawData: NativeUInt;
+    AddressOfIndex: NativeUInt;
+    AddressOfCallBacks: NativeUInt;
+    SizeOfZeroFill: Cardinal;
+    Characteristics: Cardinal;
+  end;
+
 const
   ForwardPreferences: array[0..8] of string = (
     'kernel32.dll', // prioritize over kernelbase/ntdll
@@ -190,6 +202,11 @@ var
   Buf: PByte;
   i: Integer;
   Size, Delta, IATRawOffset: Cardinal;
+  TLS: TImageTlsDirectoryNative;
+  TLSVA: NativeUInt;
+  CallbackVA: NativeUInt;
+  Callback: NativeUInt;
+  CallbackIndex: Integer;
 begin
   FS := TFileStream.Create(FileName, fmCreate);
   try
@@ -240,6 +257,74 @@ begin
       Log(ltInfo, Format('[PE2026] DelayImport dir: RVA=%X Size=%X',
         [DataDirectory[13].VirtualAddress, DataDirectory[13].Size]));
     end;
+
+    // PE2026: inspect live TLS callback metadata. Diagnostic-only.
+    if PE.NTHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress <> 0 then
+    begin
+      TLSVA := FImageBase +
+        PE.NTHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
+
+      FillChar(TLS, SizeOf(TLS), 0);
+      if RPM(TLSVA, @TLS, SizeOf(TLS)) then
+      begin
+        Log(ltInfo, Format(
+          '[TLS2026] directory VA=%X RawStart=%X RawEnd=%X Index=%X Callbacks=%X ZeroFill=%X Char=%X',
+          [TLSVA,
+           TLS.StartAddressOfRawData,
+           TLS.EndAddressOfRawData,
+           TLS.AddressOfIndex,
+           TLS.AddressOfCallBacks,
+           TLS.SizeOfZeroFill,
+           TLS.Characteristics]));
+
+        CallbackVA := TLS.AddressOfCallBacks;
+        if CallbackVA = 0 then
+          Log(ltInfo, '[TLS2026] AddressOfCallbacks = 0')
+        else
+        begin
+          CallbackIndex := 0;
+          while CallbackIndex < 32 do
+          begin
+            Callback := 0;
+            if not RPM(
+              CallbackVA + NativeUInt(CallbackIndex) * SizeOf(Pointer),
+              @Callback,
+              SizeOf(Callback)) then
+            begin
+              Log(ltInfo, Format(
+                '[TLS2026] callback[%d] read failed at %X',
+                [CallbackIndex,
+                 CallbackVA + NativeUInt(CallbackIndex) * SizeOf(Pointer)]));
+              Break;
+            end;
+
+            if Callback = 0 then
+            begin
+              Log(ltInfo, Format('[TLS2026] callback[%d] = NULL',
+                [CallbackIndex]));
+              Break;
+            end;
+
+            if Callback >= FImageBase then
+              Log(ltInfo, Format(
+                '[TLS2026] callback[%d] = %X (RVA=%X)',
+                [CallbackIndex, Callback, Callback - FImageBase]))
+            else
+              Log(ltInfo, Format(
+                '[TLS2026] callback[%d] = %X (outside image)',
+                [CallbackIndex, Callback]));
+
+            Inc(CallbackIndex);
+          end;
+        end;
+      end
+      else
+        Log(ltInfo, Format(
+          '[TLS2026] failed reading TLS directory at %X',
+          [TLSVA]));
+    end
+    else
+      Log(ltInfo, '[TLS2026] TLS directory absent');
 
     PE.SaveToStream(FS);
 
@@ -312,6 +397,7 @@ var
   WinnerVotes: Integer;
   WinnerRM: PRemoteModule;
   FuncAddr: Pointer;
+  DiagIndex: Integer;
 begin
   if FIAT = 0 then
     raise Exception.Create('Must set IAT before calling Process()');
@@ -398,6 +484,65 @@ begin
   end;
 
   // =========================================================
+  // PE2026: detailed diagnostics around unresolved ordinals
+  // =========================================================
+  for i := 0 to SlotCount - 1 do
+  begin
+    if Slots[i].IsEncodedOrdinal and
+       (Slots[i].Candidates.Count = 0) then
+    begin
+      Log(ltInfo, Format(
+        '[IAT2026] unresolved ordinal: index=%d VA=%X raw=%X ordinal=#%d',
+        [i,
+         FIAT + NativeUInt(i) * SizeOf(Pointer),
+         PNativeUInt(IAT + NativeUInt(i) * SizeOf(Pointer))^,
+         Slots[i].EncodedOrdinal]));
+
+      j := i - 8;
+      if j < 0 then
+        j := 0;
+
+      k := i + 8;
+      if k >= SlotCount then
+        k := SlotCount - 1;
+
+      while j <= k do
+      begin
+        ModuleName := '';
+
+        if Slots[j].Candidates.Count <> 0 then
+        begin
+          for DiagIndex := 0 to Slots[j].Candidates.Count - 1 do
+          begin
+            if ModuleName <> '' then
+              ModuleName := ModuleName + ',';
+
+            if Slots[j].Candidates[DiagIndex].Module <> nil then
+              ModuleName := ModuleName +
+                Slots[j].Candidates[DiagIndex].Module.Name
+            else
+              ModuleName := ModuleName + '<nil>';
+          end;
+        end
+        else
+          ModuleName := '-';
+
+        Log(ltInfo, Format(
+          '[IAT2026]   [%d] VA=%X raw=%X zero=%d encodedOrd=%d ord=#%d candidates=%s',
+          [j,
+           FIAT + NativeUInt(j) * SizeOf(Pointer),
+           PNativeUInt(IAT + NativeUInt(j) * SizeOf(Pointer))^,
+           Ord(Slots[j].IsZero),
+           Ord(Slots[j].IsEncodedOrdinal),
+           Slots[j].EncodedOrdinal,
+           ModuleName]));
+
+        Inc(j);
+      end;
+    end;
+  end;
+
+  // =========================================================
   // PASS 2: For each zero-delimited group, vote on best module
   //         and pin every slot to a candidate from that module
   // =========================================================
@@ -450,6 +595,23 @@ begin
         WinnerName := ModuleName;
       end;
     end;
+
+    // PE2026: show why an ordinal-containing group did or did not
+    // get a module winner.
+    for j := GroupStart to GroupEnd do
+      if Slots[j].IsEncodedOrdinal and
+         (Slots[j].Candidates.Count = 0) then
+      begin
+        Log(ltInfo, Format(
+          '[IAT2026] ordinal group: slots=%d..%d VA=%X..%X winner="%s" votes=%d',
+          [GroupStart,
+           GroupEnd,
+           FIAT + NativeUInt(GroupStart) * SizeOf(Pointer),
+           FIAT + NativeUInt(GroupEnd) * SizeOf(Pointer),
+           WinnerName,
+           WinnerVotes]));
+        Break;
+      end;
 
     // Pin each slot to the winning module's candidate
     for j := GroupStart to GroupEnd do
@@ -1048,7 +1210,7 @@ begin
       if VirtualQueryEx(FProcess.hProcess, Ptr, Mbi, SizeOf(Mbi)) = 0 then
         raise Exception.CreateFmt('VirtualQueryEx failed at %p', [Ptr]);
       if Mbi.RegionSize = 0 then
-        raise Exception.CreateFmt('VirtualQueryEx returned a zero region at %p', [Ptr]); // Idk if/why it would do this but we wouldn't make any progress then
+        raise Exception.CreateFmt('VirtualQueryEx returned a zero region at %p', [Ptr]); // Idk if/why it would but we wouldn't make any progress then
 
       if Mbi.State = MEM_COMMIT then
       begin
