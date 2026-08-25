@@ -406,6 +406,10 @@ var
   OrdinalCandidateRM, OrdinalWinnerRM: PRemoteModule;
   OrdinalFuncName: string;
   OrdinalFuncAddr: Pointer;
+  OriginalOrdinalHits, OriginalModuleHits: Integer;
+  BestOriginalOrdinalHits, BestOriginalModuleHits: Integer;
+  BestOriginalTieCount: Integer;
+  OriginalImport: TOriginalImport;
 begin
   if FIAT = 0 then
     raise Exception.Create('Must set IAT before calling Process()');
@@ -642,6 +646,9 @@ begin
 
       OrdinalCandidateCount := 0;
       OrdinalWinnerRM := nil;
+      BestOriginalOrdinalHits := -1;
+      BestOriginalModuleHits := -1;
+      BestOriginalTieCount := 0;
 
       for OrdinalCandidateRM in FAllModules do
       begin
@@ -650,7 +657,6 @@ begin
         for j := GroupStart to GroupEnd do
         begin
           OrdinalFuncName := '#' + IntToStr(Slots[j].EncodedOrdinal);
-
           for OrdinalFuncAddr in OrdinalCandidateRM.ExportTbl.Keys do
             if OrdinalCandidateRM.ExportTbl[OrdinalFuncAddr] = OrdinalFuncName then
             begin
@@ -667,22 +673,55 @@ begin
         if OrdinalMatched = OrdinalRequired then
         begin
           Inc(OrdinalCandidateCount);
-          OrdinalWinnerRM := OrdinalCandidateRM;
+
+          OriginalOrdinalHits := 0;
+          OriginalModuleHits := 0;
+          for OriginalImport in FOriginalImports do
+            if SameText(OriginalImport.DLLName, OrdinalCandidateRM.Name) then
+            begin
+              Inc(OriginalModuleHits);
+              for j := GroupStart to GroupEnd do
+                if SameText(OriginalImport.FuncName,
+                  '#' + IntToStr(Slots[j].EncodedOrdinal)) then
+                begin
+                  Inc(OriginalOrdinalHits);
+                  Break;
+                end;
+            end;
+
           Log(ltInfo, Format(
-            '[IAT2026]   FULL MATCH module=%s (%d/%d)',
-            [OrdinalCandidateRM.Name, OrdinalMatched, OrdinalRequired]));
+            '[IAT2026]   FULL MATCH module=%s (%d/%d) originalOrdinalHits=%d originalModuleImports=%d',
+            [OrdinalCandidateRM.Name, OrdinalMatched, OrdinalRequired,
+             OriginalOrdinalHits, OriginalModuleHits]));
+
+          if (OriginalOrdinalHits > BestOriginalOrdinalHits) or
+             ((OriginalOrdinalHits = BestOriginalOrdinalHits) and
+              (OriginalModuleHits > BestOriginalModuleHits)) then
+          begin
+            BestOriginalOrdinalHits := OriginalOrdinalHits;
+            BestOriginalModuleHits := OriginalModuleHits;
+            OrdinalWinnerRM := OrdinalCandidateRM;
+            BestOriginalTieCount := 1;
+          end
+          else if (OriginalOrdinalHits = BestOriginalOrdinalHits) and
+                  (OriginalModuleHits = BestOriginalModuleHits) then
+            Inc(BestOriginalTieCount);
         end;
       end;
 
-      if OrdinalCandidateCount = 1 then
+      if (OrdinalCandidateCount = 1) or
+         ((OrdinalCandidateCount > 1) and
+          (BestOriginalTieCount = 1) and
+          ((BestOriginalOrdinalHits > 0) or (BestOriginalModuleHits > 0))) then
       begin
         WinnerRM := OrdinalWinnerRM;
         WinnerName := WinnerRM.Name;
         WinnerVotes := OrdinalRequired;
 
         Log(ltInfo, Format(
-          '[IAT2026] ordinal-only resolved: slots=%d..%d -> %s',
-          [GroupStart, GroupEnd, WinnerName]));
+          '[IAT2026] ordinal-only resolved: slots=%d..%d -> %s (origOrd=%d origDllImports=%d)',
+          [GroupStart, GroupEnd, WinnerName,
+           BestOriginalOrdinalHits, BestOriginalModuleHits]));
 
         // Materialize normal candidates for all ordinal slots so the
         // existing thunk-building path below can remain unchanged.
@@ -715,8 +754,9 @@ begin
           [GroupStart, GroupEnd]))
       else
         Log(ltInfo, Format(
-          '[IAT2026] ordinal-only ambiguous: slots=%d..%d full-match modules=%d; leaving unresolved',
-          [GroupStart, GroupEnd, OrdinalCandidateCount]));
+          '[IAT2026] ordinal-only ambiguous: slots=%d..%d full-match modules=%d bestOrigOrd=%d bestOrigDllImports=%d tied=%d; leaving unresolved',
+          [GroupStart, GroupEnd, OrdinalCandidateCount,
+           BestOriginalOrdinalHits, BestOriginalModuleHits, BestOriginalTieCount]));
     end;
 
     // PE2026: show why an ordinal-containing group did or did not
