@@ -1,7 +1,10 @@
 unit Dumper;
 
-// Magicmida 2026 v0.2a DIAGNOSTIC-SAFE
-// IAT/TLS logging only. Does NOT guess or auto-resolve ordinal-only IAT groups.
+// Magicmida 2026 v0.2b PDATA-SORT
+// Based on v0.2a diagnostic-safe.
+// Adds x64 Exception Directory (.pdata) validation/sort by BeginAddress
+// and clears stale IMAGE_DIRECTORY_ENTRY_SECURITY in the unpacked image.
+// Does NOT guess or auto-resolve ordinal-only IAT groups.
 
 interface
 
@@ -120,6 +123,15 @@ type
     Characteristics: Cardinal;
   end;
 
+  // x64 IMAGE_RUNTIME_FUNCTION_ENTRY / RUNTIME_FUNCTION.
+  // The PE exception directory is an array of these 12-byte records.
+  TRuntimeFunction2026 = packed record
+    BeginAddress: Cardinal;
+    EndAddress: Cardinal;
+    UnwindInfoAddress: Cardinal;
+  end;
+  PRuntimeFunction2026 = ^TRuntimeFunction2026;
+
 const
   ForwardPreferences: array[0..8] of string = (
     'kernel32.dll', // prioritize over kernelbase/ntdll
@@ -210,6 +222,12 @@ var
   CallbackVA: NativeUInt;
   Callback: NativeUInt;
   CallbackIndex: Integer;
+  {$IFDEF CPUX64}
+  ExcRVA, ExcSize, ExcCount, ExcRemainder: Cardinal;
+  ExcTable: PRuntimeFunction2026;
+  ExcI, ExcJ, DisorderBefore, DisorderAfter: Integer;
+  ExcTemp: TRuntimeFunction2026;
+  {$ENDIF}
 begin
   FS := TFileStream.Create(FileName, fmCreate);
   try
@@ -220,6 +238,77 @@ begin
       raise Exception.CreateFmt('DumpToFile RPM failed (base: %X, size: %X)', [FImageBase, Size]);
 
     IATRawOffset := FIAT - FImageBase;
+
+    {$IFDEF CPUX64}
+    // v0.2b: validate and sort the x64 Exception Directory before any physical
+    // trimming. At this stage Buf is a memory-layout image, so RVA == Buf offset.
+    ExcRVA := PE.NTHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress;
+    ExcSize := PE.NTHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size;
+
+    if (ExcRVA <> 0) and (ExcSize >= SizeOf(TRuntimeFunction2026)) then
+    begin
+      ExcCount := ExcSize div SizeOf(TRuntimeFunction2026);
+      ExcRemainder := ExcSize mod SizeOf(TRuntimeFunction2026);
+
+      if (UInt64(ExcRVA) + UInt64(ExcCount) * SizeOf(TRuntimeFunction2026) <= UInt64(Size)) then
+      begin
+        ExcTable := PRuntimeFunction2026(Buf + ExcRVA);
+
+        DisorderBefore := 0;
+        for ExcI := 1 to Integer(ExcCount) - 1 do
+          if ExcTable[ExcI].BeginAddress < ExcTable[ExcI - 1].BeginAddress then
+          begin
+            Inc(DisorderBefore);
+            Log(ltInfo, Format(
+              '[PDATA2026] out-of-order before sort: idx=%d prev=%X..%X cur=%X..%X unwind=%X',
+              [ExcI,
+               ExcTable[ExcI - 1].BeginAddress,
+               ExcTable[ExcI - 1].EndAddress,
+               ExcTable[ExcI].BeginAddress,
+               ExcTable[ExcI].EndAddress,
+               ExcTable[ExcI].UnwindInfoAddress]));
+          end;
+
+        Log(ltInfo, Format(
+          '[PDATA2026] exception table RVA=%X Size=%X entries=%d remainder=%d disorderBefore=%d',
+          [ExcRVA, ExcSize, ExcCount, ExcRemainder, DisorderBefore]));
+
+        if DisorderBefore <> 0 then
+        begin
+          // Stable insertion sort. We only reorder complete RUNTIME_FUNCTION
+          // records; Begin/End/UnwindInfo values themselves are never changed.
+          for ExcI := 1 to Integer(ExcCount) - 1 do
+          begin
+            ExcTemp := ExcTable[ExcI];
+            ExcJ := ExcI - 1;
+            while (ExcJ >= 0) and
+                  (ExcTable[ExcJ].BeginAddress > ExcTemp.BeginAddress) do
+            begin
+              ExcTable[ExcJ + 1] := ExcTable[ExcJ];
+              Dec(ExcJ);
+            end;
+            ExcTable[ExcJ + 1] := ExcTemp;
+          end;
+        end;
+
+        DisorderAfter := 0;
+        for ExcI := 1 to Integer(ExcCount) - 1 do
+          if ExcTable[ExcI].BeginAddress < ExcTable[ExcI - 1].BeginAddress then
+            Inc(DisorderAfter);
+
+        Log(ltInfo, Format(
+          '[PDATA2026] sort complete: disorderAfter=%d changed=%d',
+          [DisorderAfter, Ord(DisorderBefore <> 0)]));
+      end
+      else
+        Log(ltFatal, Format(
+          '[PDATA2026] exception directory outside dump buffer: RVA=%X Size=%X DumpSize=%X',
+          [ExcRVA, ExcSize, Size]));
+    end
+    else
+      Log(ltInfo, '[PDATA2026] exception directory absent or too small');
+    {$ENDIF}
+
     // TrimHugeSections may adjust IATRawOffset depending on what is trimmed.
     Delta := PE.TrimHugeSections(Buf, IATRawOffset);
     Dec(Size, Delta);
@@ -328,6 +417,19 @@ begin
     end
     else
       Log(ltInfo, '[TLS2026] TLS directory absent');
+
+    // v0.2b: Security Directory uses a FILE OFFSET, not an RVA. Any Authenticode
+    // signature from the protected input is invalid after unpacking/rebuilding,
+    // and its old file offset may now point into an ordinary section.
+    with PE.NTHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY] do
+    begin
+      if (VirtualAddress <> 0) or (Size <> 0) then
+        Log(ltInfo, Format(
+          '[SEC2026] clearing stale Security Directory: FileOffset=%X Size=%X',
+          [VirtualAddress, Size]));
+      VirtualAddress := 0;
+      Size := 0;
+    end;
 
     PE.SaveToStream(FS);
 
