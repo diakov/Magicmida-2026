@@ -1,10 +1,11 @@
 unit Dumper;
 
-// Magicmida 2026 v0.2d CRASH-TRACE
-// Based on v0.2c.
+// Magicmida 2026 v0.2e NORMAL-vs-DEBUG
+// Based on v0.2d.
 // Keeps .pdata sorting, stale Security Directory cleanup and IAT tracing.
-// After the dump is fully written and closed, launches the unpacked EXE under
-// DEBUG_ONLY_THIS_PROCESS and records first/second-chance exceptions plus x64 context.
+// After the dump is fully written and closed:
+//   1) launches the unpacked EXE normally and records lifetime + ExitCode;
+//   2) launches it under DEBUG_ONLY_THIS_PROCESS and records exceptions/context.
 // Diagnostic build only; it does not patch the crash site.
 
 interface
@@ -158,9 +159,76 @@ begin
 end;
 
 {$IFDEF CPUX64}
+procedure TraceNormal2026(const FileName: string);
+const
+  NORMAL_TIMEOUT_MS = 15000;
+var
+  SI: TStartupInfo;
+  PI: TProcessInformation;
+  CmdLine, WorkDir: string;
+  StartTick, EndTick: QWord;
+  WaitRes: DWORD;
+  ExitCode: DWORD;
+begin
+  if not FileExists(FileName) then
+  begin
+    Log(ltFatal, '[NORMAL2026] output file not found: ' + FileName);
+    Exit;
+  end;
+
+  FillChar(SI, SizeOf(SI), 0);
+  SI.cb := SizeOf(SI);
+  FillChar(PI, SizeOf(PI), 0);
+
+  CmdLine := '"' + FileName + '"';
+  UniqueString(CmdLine);
+  WorkDir := ExtractFilePath(FileName);
+  if WorkDir = '' then
+    WorkDir := GetCurrentDir;
+
+  Log(ltInfo, '[NORMAL2026] launching dumped EXE normally: ' + FileName);
+  StartTick := GetTickCount64;
+
+  if not CreateProcess(nil, PChar(CmdLine), nil, nil, False, 0, nil,
+    PChar(WorkDir), SI, PI) then
+  begin
+    Log(ltFatal, Format('[NORMAL2026] CreateProcess failed: %d', [GetLastError]));
+    Exit;
+  end;
+
+  try
+    Log(ltInfo, Format('[NORMAL2026] started PID=%d', [PI.dwProcessId]));
+    WaitRes := WaitForSingleObject(PI.hProcess, NORMAL_TIMEOUT_MS);
+    case WaitRes of
+      WAIT_OBJECT_0:
+      begin
+        EndTick := GetTickCount64;
+        ExitCode := 0;
+        if GetExitCodeProcess(PI.hProcess, ExitCode) then
+          Log(ltInfo, Format('[NORMAL2026] exited after %d ms ExitCode=%X',
+            [EndTick - StartTick, ExitCode]))
+        else
+          Log(ltFatal, Format('[NORMAL2026] GetExitCodeProcess failed: %d', [GetLastError]));
+      end;
+      WAIT_TIMEOUT:
+      begin
+        Log(ltInfo, Format('[NORMAL2026] still running after %d ms; terminating diagnostic run',
+          [NORMAL_TIMEOUT_MS]));
+        TerminateProcess(PI.hProcess, $D1A60002);
+        WaitForSingleObject(PI.hProcess, 3000);
+      end;
+    else
+      Log(ltFatal, Format('[NORMAL2026] WaitForSingleObject failed: %d', [GetLastError]));
+    end;
+  finally
+    if PI.hThread <> 0 then CloseHandle(PI.hThread);
+    if PI.hProcess <> 0 then CloseHandle(PI.hProcess);
+  end;
+end;
+
 procedure TraceCrash2026(const FileName: string);
 const
-  TRACE_TIMEOUT_MS = 15000;
+  TRACE_TIMEOUT_MS = 20000;
 var
   SI: TStartupInfo;
   PI: TProcessInformation;
@@ -289,7 +357,9 @@ begin
 
             if MainImageBase <> 0 then
             begin
-              if ExcAddr >= MainImageBase then
+              // Avoid bogus RVAs for exceptions raised from system DLLs.
+              if (ExcAddr >= MainImageBase) and
+                 (ExcAddr < MainImageBase + $20000000) then
                 Log(ltInfo, Format(
                   '[CRASH2026] exception RVA=%X',
                   [ExcAddr - MainImageBase]))
@@ -818,7 +888,8 @@ begin
   end;
 
   {$IFDEF CPUX64}
-  // v0.2d diagnostic run happens only after the reconstructed file is closed.
+  // v0.2e diagnostics happen only after the reconstructed file is closed.
+  TraceNormal2026(FileName);
   TraceCrash2026(FileName);
   {$ENDIF}
 end;
