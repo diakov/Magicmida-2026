@@ -1,10 +1,10 @@
 unit Dumper;
 
-// Magicmida 2026 v0.2b PDATA-SORT
-// Based on v0.2a diagnostic-safe.
-// Adds x64 Exception Directory (.pdata) validation/sort by BeginAddress
-// and clears stale IMAGE_DIRECTORY_ENTRY_SECURITY in the unpacked image.
-// Does NOT guess or auto-resolve ordinal-only IAT groups.
+// Magicmida 2026 v0.2c IAT-TRACE
+// Based on v0.2b.
+// Keeps x64 Exception Directory (.pdata) sorting and stale Security Directory cleanup.
+// Adds diagnostic tracing of code references to unresolved ordinal-only IAT slots.
+// No DLL/module is guessed and no unresolved ordinal is auto-resolved.
 
 interface
 
@@ -65,6 +65,7 @@ type
     FIATImage: PByte;
     FIATImageSize: Cardinal;
     FOriginalImports: TList<TOriginalImport>;
+    FUnresolvedOrdinalSlots: TList<Cardinal>;
 
     {$IFDEF CPUX86}
     FUsrPath: string;
@@ -175,6 +176,7 @@ begin
 
   FForwards := TForwardMap.Create([doOwnsValues], 512);
   FOriginalImports := GetOriginalImports(AOriginalFile);
+  FUnresolvedOrdinalSlots := TList<Cardinal>.Create;
 end;
 
 destructor TDumper.Destroy;
@@ -183,6 +185,7 @@ var
 begin
   FForwards.Free;
   FOriginalImports.Free;
+  FUnresolvedOrdinalSlots.Free;
 
   if FAllModules <> nil then
   begin
@@ -227,6 +230,15 @@ var
   ExcTable: PRuntimeFunction2026;
   ExcI, ExcJ, DisorderBefore, DisorderAfter: Integer;
   ExcTemp: TRuntimeFunction2026;
+  TraceSlotListIndex: Integer;
+  TraceSlotIndex: Cardinal;
+  TraceSlotVA, TraceInstrVA, TraceTargetVA: NativeUInt;
+  TracePos: Cardinal;
+  TraceDisp: LongInt;
+  TraceOp: string;
+  TraceHits: Integer;
+  TraceWindowStart, TraceWindowEnd, TraceK: Cardinal;
+  TraceBytes: string;
   {$ENDIF}
 begin
   FS := TFileStream.Create(FileName, fmCreate);
@@ -240,6 +252,107 @@ begin
     IATRawOffset := FIAT - FImageBase;
 
     {$IFDEF CPUX64}
+    // v0.2c IAT Trace:
+    // Scan the dumped memory-layout image for common x64 RIP-relative
+    // instructions that directly reference unresolved ordinal-only IAT slots.
+    // This is diagnostic only: no instruction, slot or import is modified.
+    if (FUnresolvedOrdinalSlots <> nil) and
+       (FUnresolvedOrdinalSlots.Count <> 0) then
+    begin
+      Log(ltInfo, Format(
+        '[IATTRACE] scanning image for references to %d unresolved ordinal slot(s)',
+        [FUnresolvedOrdinalSlots.Count]));
+
+      for TraceSlotListIndex := 0 to FUnresolvedOrdinalSlots.Count - 1 do
+      begin
+        TraceSlotIndex := FUnresolvedOrdinalSlots[TraceSlotListIndex];
+        TraceSlotVA := FIAT + NativeUInt(TraceSlotIndex) * SizeOf(Pointer);
+        TraceHits := 0;
+
+        Log(ltInfo, Format(
+          '[IATTRACE] slot index=%d VA=%X raw=%X ordinal=#%d',
+          [TraceSlotIndex,
+           TraceSlotVA,
+           PNativeUInt(FIATImage + NativeUInt(TraceSlotIndex) * SizeOf(Pointer))^,
+           Word(PNativeUInt(FIATImage + NativeUInt(TraceSlotIndex) * SizeOf(Pointer))^ and $FFFF)]));
+
+        TracePos := 0;
+        while TracePos + 7 <= Size do
+        begin
+          TraceOp := '';
+
+          // CALL qword ptr [RIP+disp32] : FF 15 xx xx xx xx
+          if (Buf[TracePos] = $FF) and (Buf[TracePos + 1] = $15) then
+          begin
+            Move(Buf[TracePos + 2], TraceDisp, SizeOf(TraceDisp));
+            TraceInstrVA := FImageBase + TracePos;
+            TraceTargetVA := TraceInstrVA + 6 + NativeInt(TraceDisp);
+            TraceOp := 'CALL [RIP+disp32]';
+          end
+          // JMP qword ptr [RIP+disp32] : FF 25 xx xx xx xx
+          else if (Buf[TracePos] = $FF) and (Buf[TracePos + 1] = $25) then
+          begin
+            Move(Buf[TracePos + 2], TraceDisp, SizeOf(TraceDisp));
+            TraceInstrVA := FImageBase + TracePos;
+            TraceTargetVA := TraceInstrVA + 6 + NativeInt(TraceDisp);
+            TraceOp := 'JMP [RIP+disp32]';
+          end
+          // MOV/LEA r64,[RIP+disp32], including common REX prefixes 48/4C.
+          else if ((Buf[TracePos] = $48) or (Buf[TracePos] = $4C)) and
+                  ((Buf[TracePos + 1] = $8B) or (Buf[TracePos + 1] = $8D)) and
+                  ((Buf[TracePos + 2] and $C7) = $05) then
+          begin
+            Move(Buf[TracePos + 3], TraceDisp, SizeOf(TraceDisp));
+            TraceInstrVA := FImageBase + TracePos;
+            TraceTargetVA := TraceInstrVA + 7 + NativeInt(TraceDisp);
+            if Buf[TracePos + 1] = $8B then
+              TraceOp := 'MOV reg,[RIP+disp32]'
+            else
+              TraceOp := 'LEA reg,[RIP+disp32]';
+          end;
+
+          if (TraceOp <> '') and (TraceTargetVA = TraceSlotVA) then
+          begin
+            Inc(TraceHits);
+
+            if TracePos > 8 then
+              TraceWindowStart := TracePos - 8
+            else
+              TraceWindowStart := 0;
+
+            TraceWindowEnd := TracePos + 16;
+            if TraceWindowEnd >= Size then
+              TraceWindowEnd := Size - 1;
+
+            TraceBytes := '';
+            for TraceK := TraceWindowStart to TraceWindowEnd do
+            begin
+              if TraceBytes <> '' then
+                TraceBytes := TraceBytes + ' ';
+              TraceBytes := TraceBytes + IntToHex(Buf[TraceK], 2);
+            end;
+
+            Log(ltInfo, Format(
+              '[IATTRACE]   HIT #%d instrVA=%X RVA=%X op=%s target=%X bytes=%s',
+              [TraceHits,
+               TraceInstrVA,
+               TraceInstrVA - FImageBase,
+               TraceOp,
+               TraceTargetVA,
+               TraceBytes]));
+          end;
+
+          Inc(TracePos);
+        end;
+
+        Log(ltInfo, Format(
+          '[IATTRACE] slot index=%d totalDirectRefs=%d',
+          [TraceSlotIndex, TraceHits]));
+      end;
+    end
+    else
+      Log(ltInfo, '[IATTRACE] no unresolved ordinal-only slots to trace');
+
     // v0.2b: validate and sort the x64 Exception Directory before any physical
     // trimming. At this stage Buf is a memory-layout image, so RVA == Buf offset.
     ExcRVA := PE.NTHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress;
@@ -539,6 +652,7 @@ begin
 
   SlotCount := IATSize div SizeOf(Pointer);
   SetLength(Slots, SlotCount);
+  FUnresolvedOrdinalSlots.Clear;
 
   // =========================================================
   // PASS 1: Collect all candidates for every IAT slot
@@ -596,6 +710,9 @@ begin
     if Slots[i].IsEncodedOrdinal and
        (Slots[i].Candidates.Count = 0) then
     begin
+      if FUnresolvedOrdinalSlots.IndexOf(Cardinal(i)) < 0 then
+        FUnresolvedOrdinalSlots.Add(Cardinal(i));
+
       Log(ltInfo, Format(
         '[IAT2026] unresolved ordinal: index=%d VA=%X raw=%X ordinal=#%d',
         [i,
