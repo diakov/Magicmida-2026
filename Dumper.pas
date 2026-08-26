@@ -1,10 +1,11 @@
 unit Dumper;
 
-// Magicmida 2026 v0.2c IAT-TRACE
-// Based on v0.2b.
-// Keeps x64 Exception Directory (.pdata) sorting and stale Security Directory cleanup.
-// Adds diagnostic tracing of code references to unresolved ordinal-only IAT slots.
-// No DLL/module is guessed and no unresolved ordinal is auto-resolved.
+// Magicmida 2026 v0.2d CRASH-TRACE
+// Based on v0.2c.
+// Keeps .pdata sorting, stale Security Directory cleanup and IAT tracing.
+// After the dump is fully written and closed, launches the unpacked EXE under
+// DEBUG_ONLY_THIS_PROCESS and records first/second-chance exceptions plus x64 context.
+// Diagnostic build only; it does not patch the crash site.
 
 interface
 
@@ -155,6 +156,270 @@ begin
     if SameText(Name, ForwardPreferences[i]) then
       Inc(Result);
 end;
+
+{$IFDEF CPUX64}
+procedure TraceCrash2026(const FileName: string);
+const
+  TRACE_TIMEOUT_MS = 15000;
+var
+  SI: TStartupInfo;
+  PI: TProcessInformation;
+  Ev: TDebugEvent;
+  Status: DWORD;
+  CmdLine, WorkDir: string;
+  StartTick, NowTick: QWord;
+  MainImageBase: NativeUInt;
+  hThread: THandle;
+  Ctx: TContext;
+  CodeBuf: array[0..31] of Byte;
+  BytesRead: SIZE_T;
+  CodeHex: string;
+  i: Integer;
+  ExcCode: DWORD;
+  ExcAddr: NativeUInt;
+  FirstChance: Boolean;
+  SawSecondChance: Boolean;
+begin
+  if not FileExists(FileName) then
+  begin
+    Log(ltFatal, '[CRASH2026] output file not found: ' + FileName);
+    Exit;
+  end;
+
+  FillChar(SI, SizeOf(SI), 0);
+  SI.cb := SizeOf(SI);
+  FillChar(PI, SizeOf(PI), 0);
+
+  CmdLine := '"' + FileName + '"';
+  UniqueString(CmdLine);
+  WorkDir := ExtractFilePath(FileName);
+  if WorkDir = '' then
+    WorkDir := GetCurrentDir;
+
+  Log(ltInfo, '[CRASH2026] launching dumped EXE under debugger: ' + FileName);
+
+  if not CreateProcess(
+    nil,
+    PChar(CmdLine),
+    nil,
+    nil,
+    False,
+    DEBUG_ONLY_THIS_PROCESS,
+    nil,
+    PChar(WorkDir),
+    SI,
+    PI) then
+  begin
+    Log(ltFatal, Format('[CRASH2026] CreateProcess failed: %d', [GetLastError]));
+    Exit;
+  end;
+
+  MainImageBase := 0;
+  SawSecondChance := False;
+  StartTick := GetTickCount64;
+
+  try
+    while True do
+    begin
+      NowTick := GetTickCount64;
+      if NowTick - StartTick >= TRACE_TIMEOUT_MS then
+      begin
+        Log(ltInfo, Format(
+          '[CRASH2026] no second-chance crash within %d ms; terminating diagnostic run',
+          [TRACE_TIMEOUT_MS]));
+        TerminateProcess(PI.hProcess, $D1A60001);
+        Break;
+      end;
+
+      if not WaitForDebugEvent(Ev, 250) then
+      begin
+        if GetLastError = ERROR_SEM_TIMEOUT then
+          Continue;
+
+        Log(ltFatal, Format(
+          '[CRASH2026] WaitForDebugEvent failed: %d',
+          [GetLastError]));
+        Break;
+      end;
+
+      Status := DBG_CONTINUE;
+
+      case Ev.dwDebugEventCode of
+        CREATE_PROCESS_DEBUG_EVENT:
+        begin
+          MainImageBase := NativeUInt(Ev.CreateProcessInfo.lpBaseOfImage);
+          Log(ltInfo, Format(
+            '[CRASH2026] process started PID=%d imageBase=%X',
+            [Ev.dwProcessId, MainImageBase]));
+
+          if Ev.CreateProcessInfo.hFile <> 0 then
+            CloseHandle(Ev.CreateProcessInfo.hFile);
+        end;
+
+        LOAD_DLL_DEBUG_EVENT:
+        begin
+          if Ev.LoadDll.hFile <> 0 then
+            CloseHandle(Ev.LoadDll.hFile);
+        end;
+
+        EXCEPTION_DEBUG_EVENT:
+        begin
+          ExcCode := Ev.Exception.ExceptionRecord.ExceptionCode;
+          ExcAddr := NativeUInt(Ev.Exception.ExceptionRecord.ExceptionAddress);
+          FirstChance := Ev.Exception.dwFirstChance <> 0;
+
+          // The loader's initial breakpoint is normal under a debugger.
+          if (ExcCode = EXCEPTION_BREAKPOINT) and FirstChance then
+          begin
+            Log(ltInfo, Format(
+              '[CRASH2026] initial breakpoint at %X',
+              [ExcAddr]));
+            Status := DBG_CONTINUE;
+          end
+          else
+          begin
+            if FirstChance then
+              Log(ltInfo, Format(
+                '[CRASH2026] first-chance exception code=%X address=%X',
+                [ExcCode, ExcAddr]))
+            else
+              Log(ltFatal, Format(
+                '[CRASH2026] SECOND-CHANCE exception code=%X address=%X',
+                [ExcCode, ExcAddr]));
+
+            if MainImageBase <> 0 then
+            begin
+              if ExcAddr >= MainImageBase then
+                Log(ltInfo, Format(
+                  '[CRASH2026] exception RVA=%X',
+                  [ExcAddr - MainImageBase]))
+              else
+                Log(ltInfo, '[CRASH2026] exception address is outside main image');
+            end;
+
+            hThread := OpenThread(
+              THREAD_GET_CONTEXT or THREAD_QUERY_INFORMATION,
+              False,
+              Ev.dwThreadId);
+
+            if hThread <> 0 then
+            begin
+              try
+                FillChar(Ctx, SizeOf(Ctx), 0);
+                Ctx.ContextFlags := CONTEXT_FULL;
+
+                if GetThreadContext(hThread, Ctx) then
+                begin
+                  Log(ltInfo, Format(
+                    '[CRASH2026] RIP=%X RSP=%X RBP=%X',
+                    [Ctx.Rip, Ctx.Rsp, Ctx.Rbp]));
+                  Log(ltInfo, Format(
+                    '[CRASH2026] RAX=%X RBX=%X RCX=%X RDX=%X',
+                    [Ctx.Rax, Ctx.Rbx, Ctx.Rcx, Ctx.Rdx]));
+                  Log(ltInfo, Format(
+                    '[CRASH2026] RSI=%X RDI=%X R8=%X R9=%X',
+                    [Ctx.Rsi, Ctx.Rdi, Ctx.R8, Ctx.R9]));
+                  Log(ltInfo, Format(
+                    '[CRASH2026] R10=%X R11=%X R12=%X R13=%X R14=%X R15=%X',
+                    [Ctx.R10, Ctx.R11, Ctx.R12, Ctx.R13,
+                     Ctx.R14, Ctx.R15]));
+                end
+                else
+                  Log(ltInfo, Format(
+                    '[CRASH2026] GetThreadContext failed: %d',
+                    [GetLastError]));
+              finally
+                CloseHandle(hThread);
+              end;
+            end
+            else
+              Log(ltInfo, Format(
+                '[CRASH2026] OpenThread failed: %d',
+                [GetLastError]));
+
+            FillChar(CodeBuf, SizeOf(CodeBuf), 0);
+            BytesRead := 0;
+            if ReadProcessMemory(
+              PI.hProcess,
+              Pointer(ExcAddr),
+              @CodeBuf[0],
+              SizeOf(CodeBuf),
+              BytesRead) and (BytesRead <> 0) then
+            begin
+              CodeHex := '';
+              for i := 0 to Integer(BytesRead) - 1 do
+              begin
+                if CodeHex <> '' then
+                  CodeHex := CodeHex + ' ';
+                CodeHex := CodeHex + IntToHex(CodeBuf[i], 2);
+              end;
+
+              Log(ltInfo, '[CRASH2026] bytes@exception: ' + CodeHex);
+            end
+            else
+              Log(ltInfo, Format(
+                '[CRASH2026] ReadProcessMemory at exception failed: %d',
+                [GetLastError]));
+
+            if (ExcCode = EXCEPTION_ACCESS_VIOLATION) and
+               (Ev.Exception.ExceptionRecord.NumberParameters >= 2) then
+            begin
+              case Ev.Exception.ExceptionRecord.ExceptionInformation[0] of
+                0: Log(ltInfo, Format(
+                     '[CRASH2026] AV type=READ address=%X',
+                     [Ev.Exception.ExceptionRecord.ExceptionInformation[1]]));
+                1: Log(ltInfo, Format(
+                     '[CRASH2026] AV type=WRITE address=%X',
+                     [Ev.Exception.ExceptionRecord.ExceptionInformation[1]]));
+                8: Log(ltInfo, Format(
+                     '[CRASH2026] AV type=EXECUTE address=%X',
+                     [Ev.Exception.ExceptionRecord.ExceptionInformation[1]]));
+              else
+                Log(ltInfo, Format(
+                  '[CRASH2026] AV type=%d address=%X',
+                  [Ev.Exception.ExceptionRecord.ExceptionInformation[0],
+                   Ev.Exception.ExceptionRecord.ExceptionInformation[1]]));
+              end;
+            end;
+
+            // Preserve normal Windows exception dispatch. First chance is offered
+            // to the program; second chance is allowed to terminate it naturally.
+            Status := DBG_EXCEPTION_NOT_HANDLED;
+
+            if not FirstChance then
+              SawSecondChance := True;
+          end;
+        end;
+
+        EXIT_PROCESS_DEBUG_EVENT:
+        begin
+          Log(ltInfo, Format(
+            '[CRASH2026] process exited code=%X secondChanceSeen=%d',
+            [Ev.ExitProcess.dwExitCode, Ord(SawSecondChance)]));
+          ContinueDebugEvent(Ev.dwProcessId, Ev.dwThreadId, DBG_CONTINUE);
+          Break;
+        end;
+      end;
+
+      if not ContinueDebugEvent(
+        Ev.dwProcessId,
+        Ev.dwThreadId,
+        Status) then
+      begin
+        Log(ltFatal, Format(
+          '[CRASH2026] ContinueDebugEvent failed: %d',
+          [GetLastError]));
+        Break;
+      end;
+    end;
+  finally
+    if PI.hThread <> 0 then
+      CloseHandle(PI.hThread);
+    if PI.hProcess <> 0 then
+      CloseHandle(PI.hProcess);
+  end;
+end;
+{$ENDIF}
 
 { TDumper }
 
@@ -551,6 +816,11 @@ begin
   finally
     FS.Free;
   end;
+
+  {$IFDEF CPUX64}
+  // v0.2d diagnostic run happens only after the reconstructed file is closed.
+  TraceCrash2026(FileName);
+  {$ENDIF}
 end;
 
 function TDumper.DetermineIATSize(IAT: PByte): UInt32;
