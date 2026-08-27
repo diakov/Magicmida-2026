@@ -1,12 +1,12 @@
 unit Dumper;
 
-// Magicmida 2026 v0.2e NORMAL-vs-DEBUG
-// Based on v0.2d.
-// Keeps .pdata sorting, stale Security Directory cleanup and IAT tracing.
-// After the dump is fully written and closed:
-//   1) launches the unpacked EXE normally and records lifetime + ExitCode;
-//   2) launches it under DEBUG_ONLY_THIS_PROCESS and records exceptions/context.
-// Diagnostic build only; it does not patch the crash site.
+// Magicmida 2026 v0.2f HANG/WINDOW-TRACE
+// Based on v0.2e.
+// Keeps .pdata sorting, stale Security Directory cleanup, IAT tracing,
+// normal-vs-debug execution diagnostics, and adds a 3-second snapshot of:
+//   - top-level windows owned by the normal-run process;
+//   - all process threads with x64 RIP/RSP and bytes at RIP.
+// Diagnostic build only; it does not patch the target process.
 
 interface
 
@@ -159,9 +159,158 @@ begin
 end;
 
 {$IFDEF CPUX64}
+var
+  GTraceWindowPID: DWORD = 0;
+  GTraceWindowCount: Integer = 0;
+
+function TraceEnumWindowsProc(hWnd: HWND; lParam: LPARAM): BOOL; stdcall;
+var
+  PID: DWORD;
+  TitleBuf: array[0..511] of WideChar;
+  ClassBuf: array[0..255] of WideChar;
+  TitleText, ClassText: UnicodeString;
+begin
+  Result := True;
+  PID := 0;
+  GetWindowThreadProcessId(hWnd, @PID);
+
+  if PID <> GTraceWindowPID then
+    Exit;
+
+  Inc(GTraceWindowCount);
+
+  FillChar(TitleBuf, SizeOf(TitleBuf), 0);
+  FillChar(ClassBuf, SizeOf(ClassBuf), 0);
+
+  GetWindowTextW(hWnd, @TitleBuf[0], Length(TitleBuf));
+  GetClassNameW(hWnd, @ClassBuf[0], Length(ClassBuf));
+
+  TitleText := UnicodeString(PWideChar(@TitleBuf[0]));
+  ClassText := UnicodeString(PWideChar(@ClassBuf[0]));
+
+  Log(ltInfo, Format(
+    '[HANG2026] window hwnd=%X visible=%d enabled=%d class="%s" title="%s"',
+    [NativeUInt(hWnd),
+     Ord(IsWindowVisible(hWnd)),
+     Ord(IsWindowEnabled(hWnd)),
+     string(ClassText),
+     string(TitleText)]));
+end;
+
+procedure TraceProcessThreads2026(hProcess: THandle; PID: DWORD);
+var
+  Snap: THandle;
+  TE: TThreadEntry32;
+  hThread: THandle;
+  Ctx: TContext;
+  SuspendResult: DWORD;
+  CodeBuf: array[0..15] of Byte;
+  BytesRead: SIZE_T;
+  CodeHex: string;
+  i: Integer;
+begin
+  Snap := CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+  if Snap = INVALID_HANDLE_VALUE then
+  begin
+    Log(ltFatal, Format(
+      '[HANG2026] CreateToolhelp32Snapshot(THREAD) failed: %d',
+      [GetLastError]));
+    Exit;
+  end;
+
+  try
+    FillChar(TE, SizeOf(TE), 0);
+    TE.dwSize := SizeOf(TE);
+
+    if not Thread32First(Snap, TE) then
+    begin
+      Log(ltFatal, Format(
+        '[HANG2026] Thread32First failed: %d',
+        [GetLastError]));
+      Exit;
+    end;
+
+    repeat
+      if TE.th32OwnerProcessID = PID then
+      begin
+        hThread := OpenThread(
+          THREAD_GET_CONTEXT or THREAD_QUERY_INFORMATION or THREAD_SUSPEND_RESUME,
+          False,
+          TE.th32ThreadID);
+
+        if hThread = 0 then
+        begin
+          Log(ltInfo, Format(
+            '[HANG2026] thread TID=%d OpenThread failed=%d',
+            [TE.th32ThreadID, GetLastError]));
+        end
+        else
+        begin
+          try
+            SuspendResult := SuspendThread(hThread);
+            if SuspendResult = DWORD(-1) then
+            begin
+              Log(ltInfo, Format(
+                '[HANG2026] thread TID=%d SuspendThread failed=%d',
+                [TE.th32ThreadID, GetLastError]));
+            end
+            else
+            begin
+              try
+                FillChar(Ctx, SizeOf(Ctx), 0);
+                Ctx.ContextFlags := CONTEXT_FULL;
+
+                if GetThreadContext(hThread, Ctx) then
+                begin
+                  Log(ltInfo, Format(
+                    '[HANG2026] thread TID=%d RIP=%X RSP=%X RBP=%X',
+                    [TE.th32ThreadID, Ctx.Rip, Ctx.Rsp, Ctx.Rbp]));
+
+                  FillChar(CodeBuf, SizeOf(CodeBuf), 0);
+                  BytesRead := 0;
+                  if ReadProcessMemory(
+                       hProcess,
+                       Pointer(Ctx.Rip),
+                       @CodeBuf[0],
+                       SizeOf(CodeBuf),
+                       BytesRead) and (BytesRead <> 0) then
+                  begin
+                    CodeHex := '';
+                    for i := 0 to Integer(BytesRead) - 1 do
+                    begin
+                      if CodeHex <> '' then
+                        CodeHex := CodeHex + ' ';
+                      CodeHex := CodeHex + IntToHex(CodeBuf[i], 2);
+                    end;
+
+                    Log(ltInfo, Format(
+                      '[HANG2026] thread TID=%d bytes@RIP=%s',
+                      [TE.th32ThreadID, CodeHex]));
+                  end;
+                end
+                else
+                  Log(ltInfo, Format(
+                    '[HANG2026] thread TID=%d GetThreadContext failed=%d',
+                    [TE.th32ThreadID, GetLastError]));
+              finally
+                ResumeThread(hThread);
+              end;
+            end;
+          finally
+            CloseHandle(hThread);
+          end;
+        end;
+      end;
+    until not Thread32Next(Snap, TE);
+  finally
+    CloseHandle(Snap);
+  end;
+end;
+
 procedure TraceNormal2026(const FileName: string);
 const
   NORMAL_TIMEOUT_MS = 15000;
+  SNAPSHOT_AT_MS = 3000;
 var
   SI: TStartupInfo;
   PI: TProcessInformation;
@@ -198,31 +347,77 @@ begin
 
   try
     Log(ltInfo, Format('[NORMAL2026] started PID=%d', [PI.dwProcessId]));
-    WaitRes := WaitForSingleObject(PI.hProcess, NORMAL_TIMEOUT_MS);
-    case WaitRes of
-      WAIT_OBJECT_0:
+
+    WaitRes := WaitForSingleObject(PI.hProcess, SNAPSHOT_AT_MS);
+
+    if WaitRes = WAIT_OBJECT_0 then
+    begin
+      EndTick := GetTickCount64;
+      ExitCode := 0;
+      if GetExitCodeProcess(PI.hProcess, ExitCode) then
+        Log(ltInfo, Format(
+          '[NORMAL2026] exited after %d ms ExitCode=%X',
+          [EndTick - StartTick, ExitCode]))
+      else
+        Log(ltFatal, Format(
+          '[NORMAL2026] GetExitCodeProcess failed: %d',
+          [GetLastError]));
+    end
+    else if WaitRes = WAIT_TIMEOUT then
+    begin
+      Log(ltInfo, Format(
+        '[HANG2026] process still alive at %d ms; taking snapshot',
+        [SNAPSHOT_AT_MS]));
+
+      GTraceWindowPID := PI.dwProcessId;
+      GTraceWindowCount := 0;
+      EnumWindows(@TraceEnumWindowsProc, 0);
+
+      Log(ltInfo, Format(
+        '[HANG2026] top-level windows: %d',
+        [GTraceWindowCount]));
+
+      TraceProcessThreads2026(PI.hProcess, PI.dwProcessId);
+
+      WaitRes := WaitForSingleObject(
+        PI.hProcess,
+        NORMAL_TIMEOUT_MS - SNAPSHOT_AT_MS);
+
+      if WaitRes = WAIT_OBJECT_0 then
       begin
         EndTick := GetTickCount64;
         ExitCode := 0;
         if GetExitCodeProcess(PI.hProcess, ExitCode) then
-          Log(ltInfo, Format('[NORMAL2026] exited after %d ms ExitCode=%X',
+          Log(ltInfo, Format(
+            '[NORMAL2026] exited after %d ms ExitCode=%X',
             [EndTick - StartTick, ExitCode]))
         else
-          Log(ltFatal, Format('[NORMAL2026] GetExitCodeProcess failed: %d', [GetLastError]));
-      end;
-      WAIT_TIMEOUT:
+          Log(ltFatal, Format(
+            '[NORMAL2026] GetExitCodeProcess failed: %d',
+            [GetLastError]));
+      end
+      else if WaitRes = WAIT_TIMEOUT then
       begin
-        Log(ltInfo, Format('[NORMAL2026] still running after %d ms; terminating diagnostic run',
+        Log(ltInfo, Format(
+          '[NORMAL2026] still running after %d ms; terminating diagnostic run',
           [NORMAL_TIMEOUT_MS]));
         TerminateProcess(PI.hProcess, $D1A60002);
         WaitForSingleObject(PI.hProcess, 3000);
-      end;
+      end
+      else
+        Log(ltFatal, Format(
+          '[NORMAL2026] second WaitForSingleObject failed: %d',
+          [GetLastError]));
+    end
     else
-      Log(ltFatal, Format('[NORMAL2026] WaitForSingleObject failed: %d', [GetLastError]));
-    end;
+      Log(ltFatal, Format(
+        '[NORMAL2026] first WaitForSingleObject failed: %d',
+        [GetLastError]));
   finally
-    if PI.hThread <> 0 then CloseHandle(PI.hThread);
-    if PI.hProcess <> 0 then CloseHandle(PI.hProcess);
+    if PI.hThread <> 0 then
+      CloseHandle(PI.hThread);
+    if PI.hProcess <> 0 then
+      CloseHandle(PI.hProcess);
   end;
 end;
 
